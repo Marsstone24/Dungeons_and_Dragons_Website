@@ -1,1 +1,1 @@
-# StudyOrganizerRust
+# This is a free time project for a website where you are able to upload your character sheets from D&D and also play with the characters in the future
