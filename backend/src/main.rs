@@ -1,11 +1,17 @@
 #![allow(unused)]
 
-use std::io;
-use std::fs;
+use std::collections::HashSet;
+use colored::*;
 use clap::{Parser, Subcommand};
 use dotenvy::dotenv;
 use serde::de;
-use sqlx::{MySql, Pool, mysql::MySqlPoolOptions, Row};
+use sqlx::{MySql, Pool, Row, mysql::MySqlPoolOptions};
+use std::ffi::OsStr;
+use std::ffi::OsString;
+use std::fs;
+use std::io;
+use std::option;
+use futures::stream::{StreamExt, FuturesUnordered};
 
 const ASK_FOR_TABLES: &str = "SELECT TABLE_NAME FROM information_schema.tables WHERE TABLE_SCHEMA = 'Dungeons_and_Dragons_DB'";
 
@@ -20,9 +26,8 @@ struct Cli {
 // Data Definition Language
 #[derive(Subcommand)]
 enum AdminCommands {
-    Import {name: Option<String>},
-    Alter { name: String },
-    Drop { name: String },
+    Up { name: Option<String> },
+    Down { name: Option<String> },
 }
 
 // Access Commands for Frontend
@@ -36,62 +41,147 @@ enum AccessCommands {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-        dotenv().ok();
+    dotenv().ok();
 
-        let cli = Cli::parse();
-        let database_url = std::env::var("DB_URL").expect("You must add a DB_URL inside your .env file");
+    let cli = Cli::parse();
+    let database_url =
+        std::env::var("DB_URL").expect("You must add a DB_URL inside your .env file");
 
-        let pool = MySqlPoolOptions::new()
-            .max_connections(5)
-            .connect(&database_url)
-            .await?;
+    let pool = MySqlPoolOptions::new()
+        .max_connections(5)
+        .connect(&database_url)
+        .await?;
 
-        match cli.command {
-            AdminCommands::Import { name } => create_table(name, &pool).await?,
-            AdminCommands::Alter { name } => alter_table(name).await?,
-            AdminCommands::Drop { name } => drop_table(name).await?,
-        }
-        Ok(())
+    match cli.command {
+        AdminCommands::Up { name } => migrate_table(name, &pool).await?,
+        AdminCommands::Down { name } => drop_table(name, &pool).await?,
+    }
+    Ok(())
 }
 
-async fn create_table(name: Option<String>, pool: &Pool<MySql>) -> Result<(), Box<dyn std::error::Error>> {
+async fn migrate_table(name: Option<String>, pool: &Pool<MySql>) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(name) = name {
         let query = fs::read_to_string(format!("tables/{}.sql", name))?;
         println!("Importing table...");
         sqlx::query(query.as_str()).execute(pool).await?;
     } else {
         let rows = sqlx::query(ASK_FOR_TABLES).fetch_all(pool).await?;
-        let tables = rows.iter().map(|row| row.get::<String,_>("TABLE_NAME")).collect::<Vec<String>>();
+        let existing_tables: HashSet<String> = rows
+            .iter()
+            .map(|row| row.get::<String, _>("TABLE_NAME"))
+            .collect();
+        let all_tables_as_read_dir = fs::read_dir("tables/")?;
+
+        let mut all_tables: Vec<String> = Vec::new();
+        let mut skipped_files: Vec<OsString> = Vec::new();
+        for result_entry in all_tables_as_read_dir {
+            let entry = result_entry?;
+            let path = entry.path();
+            
+            if path.extension().and_then(|e| e.to_str()) == Some("sql") {
+                if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
+                    all_tables.push(name.to_string());
+                }
+            }
+        }
+
+        let tables: Vec<String> = all_tables.into_iter().filter(|table| !existing_tables.contains(table)).collect();
+        
+        if tables.is_empty() {
+            println!("{}", "All tables are already inserted!".blue());
+            return Ok(())
+        }
 
         for table in &tables {
             println!("- {}", table);
         }
-        println!("Do you want to import this {} tables? yes/no [no]:", &tables.len());
-        
-        let mut _buffer = String::new();
-        io::stdin().read_line(&mut _buffer).expect("failed to read input");
-        match _buffer.as_str().trim() {
-            "yes" => println!(""),
-            "no" => return Ok(()),
-            _ => return Ok(())
+        println!("Do you want to import this tables? yes/no [no]:");
+
+        let mut buffer = String::new();
+        io::stdin().read_line(&mut buffer).expect("failed to read input");
+
+        let input = buffer.trim().to_ascii_lowercase();
+        match input.chars().next().unwrap_or('n') {
+            'y' | 'j' => (),
+            _ => {
+                println!("Aborting...");
+                return Ok(())
+            }
         }
+
         println!("Importing tables...");
-        // yellow Exchange the current for with a extern function which uses futures::stream::FutureUnordered to asnychronise all table creations to create them simultaniously
+
+        let mut insert_tasks  = FuturesUnordered::new();
+
         for table in tables {
             let query = fs::read_to_string(format!("tables/{}.sql", table))?;
-            sqlx::query(query.as_str()).execute(pool).await?;
+            insert_tasks.push(async move {
+                sqlx::query(query.as_str()).execute(pool).await?;
+                println!("Table {} was successfully inserted", table);
+                Ok::<(), Box<dyn std::error::Error>>(())
+            });
         }
+
+        while let Some(result) = insert_tasks.next().await {
+            result?
+        }
+
     }
     println!("Done!");
     Ok(())
 }
 
-async fn alter_table(name: String) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Not made this command yet!");
-    Ok(())
-}
+async fn drop_table(name: Option<String>, pool: &Pool<MySql>) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(name) = name {
+        let query = format!("DROP TABLE IF EXISTS {};", name);
+        println!("Dropping table...");
+        sqlx::query(query.as_str()).execute(pool).await?;
+    } else {
+        let rows = sqlx::query(ASK_FOR_TABLES).fetch_all(pool).await?;
+        let existing_tables: HashSet<String> = rows
+            .iter()
+            .map(|row| row.get::<String, _>("TABLE_NAME"))
+            .collect();
 
-async fn drop_table(name: String) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Not made this command yet!");
+        if existing_tables.is_empty() {
+            println!("{}", "The database has no tables at the moment!".blue());
+            return Ok(())
+        }
+
+        for table in &existing_tables {
+            println!("- {}", table);
+        }
+        println!("Are you sure to drop all this tables? yes/no [no]:");
+
+        let mut buffer = String::new();
+        io::stdin().read_line(&mut buffer).expect("failed to read input");
+
+        let input = buffer.trim().to_ascii_lowercase();
+        match input.chars().next().unwrap_or('n') {
+            'y' | 'j' => (),
+            _ => {
+                println!("Aborting...");
+                return Ok(())
+            }
+        }
+
+        println!("Dropping tables...");
+
+        let mut drop_tasks = FuturesUnordered::new();
+
+        for table in existing_tables {
+            let query = format!("DROP TABLE {};", table);
+            drop_tasks.push(async move {
+                sqlx::query(query.as_str()).execute(pool).await?;
+                println!("Table {} was successfully dropped", table);
+                Ok::<(), Box<dyn std::error::Error>>(())
+            });
+        }
+
+        while let Some(result) = drop_tasks.next().await {
+            result?
+        }
+    }
+
     Ok(())
 }
